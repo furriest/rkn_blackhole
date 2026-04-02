@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Blackhole Routes Updater — с поддержкой whitelist
+Blackhole Routes Updater — с поддержкой whitelist и локального blacklist
 """
 
 import sys
@@ -8,23 +8,10 @@ import requests
 import tempfile
 import subprocess
 import argparse
+import configparser
 from ipaddress import ip_network, collapse_addresses
 from pathlib import Path
 from typing import List, Set
-
-
-# ==================== НАСТРОЙКИ ====================
-
-URLS: List[str] = [
-    "https://raw.githubusercontent.com/C24Be/AS_Network_List/refs/heads/main/blacklists/blacklist-v4.txt",
-    "https://raw.githubusercontent.com/C24Be/AS_Network_List/refs/heads/main/blacklists/blacklist-v6.txt"
-]
-
-OUTPUT_FILE = ""
-PROTO_MARK = "blackhole"
-WHITELIST_FILENAME = "whitelist.txt"
-
-# ===================================================
 
 
 def get_script_dir() -> Path:
@@ -32,17 +19,52 @@ def get_script_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def load_whitelist() -> Set[str]:
-    """Загружает whitelist.txt из той же папки, где лежит скрипт"""
+def load_config() -> configparser.ConfigParser:
+    """Загружает config.ini"""
     script_dir = get_script_dir()
-    whitelist_path = script_dir / WHITELIST_FILENAME
+    config_path = script_dir / "config.ini"
 
-    if not whitelist_path.exists():
-        print(f"ℹ️  Файл {WHITELIST_FILENAME} не найден. Whitelist отключён.")
+    config = configparser.ConfigParser()
+    config.optionxform = str  # сохраняем регистр ключей
+
+    if not config_path.exists():
+        print(f"❌ Файл config.ini не найден! Создайте его по примеру.")
+        sys.exit(1)
+
+    try:
+        config.read(config_path, encoding='utf-8')
+        print(f"✅ Конфигурация загружена: {config_path}")
+        return config
+    except Exception as e:
+        print(f"❌ Ошибка чтения config.ini: {e}")
+        sys.exit(1)
+
+
+def get_list_from_config(config: configparser.ConfigParser, section: str, key: str) -> List[str]:
+    """Получает список строк из конфига (поддерживает многострочные значения)"""
+    if not config.has_section(section) or not config.has_option(section, key):
+        return []
+
+    value = config.get(section, key).strip()
+    if not value:
+        return []
+
+    # Разбиваем по строкам и очищаем
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    return lines
+
+
+def load_prefixes_from_file(filename: str, description: str) -> Set[str]:
+    """Загружает префиксы из файла (whitelist или локальный blacklist)"""
+    script_dir = get_script_dir()
+    file_path = script_dir / filename
+
+    if not file_path.exists():
+        print(f"ℹ️  Файл {filename} не найден. {description} отключён.")
         return set()
 
     try:
-        with open(whitelist_path, encoding='utf-8') as f:
+        with open(file_path, encoding='utf-8') as f:
             lines = f.readlines()
 
         prefixes = set()
@@ -56,10 +78,10 @@ def load_whitelist() -> Set[str]:
             except Exception:
                 continue
 
-        print(f"✅ Загружен whitelist: {len(prefixes)} префиксов")
+        print(f"✅ Загружен {description}: {len(prefixes)} префиксов")
         return prefixes
     except Exception as e:
-        print(f"⚠️  Ошибка при чтении {WHITELIST_FILENAME}: {e}")
+        print(f"⚠️  Ошибка при чтении {filename}: {e}")
         return set()
 
 
@@ -89,7 +111,7 @@ def parse_prefixes(lines: List[str]) -> Set[str]:
 
 
 def networks_overlap(net1: str, net2: str) -> bool:
-    """Проверяет, пересекаются ли два префикса (в любую сторону)"""
+    """Проверяет, пересекаются ли два префикса"""
     try:
         n1 = ip_network(net1, strict=False)
         n2 = ip_network(net2, strict=False)
@@ -99,7 +121,7 @@ def networks_overlap(net1: str, net2: str) -> bool:
 
 
 def filter_blacklist_with_whitelist(blacklist: Set[str], whitelist: Set[str]) -> Set[str]:
-    """Удаляет из blacklist все префиксы, которые пересекаются с любым префиксом из whitelist"""
+    """Удаляет из blacklist префиксы, пересекающиеся с whitelist"""
     if not whitelist:
         return blacklist.copy()
 
@@ -107,11 +129,7 @@ def filter_blacklist_with_whitelist(blacklist: Set[str], whitelist: Set[str]) ->
     skipped = 0
 
     for bl_prefix in blacklist:
-        should_skip = False
-        for wl_prefix in whitelist:
-            if networks_overlap(bl_prefix, wl_prefix):
-                should_skip = True
-                break
+        should_skip = any(networks_overlap(bl_prefix, wl_prefix) for wl_prefix in whitelist)
         if should_skip:
             skipped += 1
         else:
@@ -146,28 +164,28 @@ def summarize_networks(prefix_set: Set[str]):
     return summarized
 
 
-def generate_batch_commands(summarized):
+def generate_batch_commands(summarized, proto_mark: str):
     ipv4_cmds = []
     ipv6_cmds = []
 
     for net in summarized:
         if net.version == 4:
-            ipv4_cmds.append(f"route replace blackhole {net} proto {PROTO_MARK}")
+            ipv4_cmds.append(f"route replace blackhole {net} proto {proto_mark}")
         else:
-            ipv6_cmds.append(f"route replace blackhole {net} proto {PROTO_MARK}")
+            ipv6_cmds.append(f"route replace blackhole {net} proto {proto_mark}")
 
     return ipv4_cmds, ipv6_cmds
 
 
-def flush_old_routes(dry_run: bool = False):
+def flush_old_routes(proto_mark: str, dry_run: bool = False):
     print("🧹 Удаляем старые blackhole маршруты...")
     if dry_run:
-        print(f"   [DRY-RUN] ip route flush proto {PROTO_MARK}")
-        print(f"   [DRY-RUN] ip -6 route flush proto {PROTO_MARK}")
+        print(f"   [DRY-RUN] ip route flush proto {proto_mark}")
+        print(f"   [DRY-RUN] ip -6 route flush proto {proto_mark}")
         return
 
-    subprocess.run(f"ip route flush proto {PROTO_MARK}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(f"ip -6 route flush proto {PROTO_MARK}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(f"ip route flush proto {proto_mark}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(f"ip -6 route flush proto {proto_mark}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def apply_routes(ipv4_cmds: List[str], ipv6_cmds: List[str], dry_run: bool = False):
@@ -206,30 +224,40 @@ def main():
     parser = argparse.ArgumentParser(description="Blackhole Routes Updater")
     parser.add_argument('--dry-run', action='store_true', help='Только показать действия, без изменения маршрутов')
     args = parser.parse_args()
-
     dry_run = args.dry_run
 
-    print("=== Blackhole Routes Updater (с whitelist) ===\n")
+    print("=== Blackhole Routes Updater (с whitelist и локальным blacklist) ===\n")
 
-    # Загружаем whitelist
-    whitelist = load_whitelist()
+    # Загружаем конфигурацию
+    config = load_config()
 
-    # Скачиваем и парсим blacklist
-    all_prefixes: Set[str] = set()
-    for url in URLS:
+    PROTO_MARK = config.get('General', 'PROTO_MARK', fallback='blackhole')
+    OUTPUT_FILE = config.get('General', 'OUTPUT_FILE', fallback='')
+    WHITELIST_FILENAME = config.get('General', 'WHITELIST_FILENAME', fallback='whitelist.txt')
+    BLACKLIST_FILENAME = config.get('General', 'BLACKLIST_FILENAME', fallback='blacklist.txt')
+
+    # Загружаем списки
+    whitelist = load_prefixes_from_file(WHITELIST_FILENAME, "whitelist")
+    local_blacklist = load_prefixes_from_file(BLACKLIST_FILENAME, "локальный blacklist")
+
+    # Скачиваем префиксы из URL
+    urls = get_list_from_config(config, 'Sources', 'URLS')
+    remote_prefixes: Set[str] = set()
+
+    for url in urls:
         lines = download_prefixes(url)
         parsed = parse_prefixes(lines)
-        all_prefixes.update(parsed)
+        remote_prefixes.update(parsed)
         print(f"   Найдено префиксов: {len(parsed)}")
 
-    if not all_prefixes:
-        print("Ошибка: не найдено префиксов.")
-        sys.exit(1)
+    print(f"\nВсего из удалённых источников: {len(remote_prefixes)} префиксов")
 
-    print(f"\nВсего уникальных префиксов из blacklists: {len(all_prefixes)}")
+    # Объединяем все blacklist'ы
+    all_blacklist = remote_prefixes.union(local_blacklist)
+    print(f"После добавления локального blacklist всего: {len(all_blacklist)} префиксов")
 
-    # Применяем whitelist-фильтрацию
-    filtered_prefixes = filter_blacklist_with_whitelist(all_prefixes, whitelist)
+    # Фильтрация по whitelist
+    filtered_prefixes = filter_blacklist_with_whitelist(all_blacklist, whitelist)
 
     print(f"После фильтрации whitelist осталось: {len(filtered_prefixes)} префиксов")
 
@@ -237,14 +265,14 @@ def main():
     summarized = summarize_networks(filtered_prefixes)
     print(f"После суммаризации осталось: {len(summarized)} префиксов")
 
-    ipv4_cmds, ipv6_cmds = generate_batch_commands(summarized)
+    ipv4_cmds, ipv6_cmds = generate_batch_commands(summarized, PROTO_MARK)
 
-    flush_old_routes(dry_run)
+    flush_old_routes(PROTO_MARK, dry_run)
     apply_routes(ipv4_cmds, ipv6_cmds, dry_run)
 
-    # Сохраняем файл только если OUTPUT_FILE не пустая строка
+    # Сохранение в файл (если указан)
     if OUTPUT_FILE:
-        output_path = Path(OUTPUT_FILE)
+        output_path = get_script_dir() / OUTPUT_FILE
         try:
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write("#!/bin/bash\n")
@@ -263,7 +291,7 @@ def main():
         except Exception as e:
             print(f"⚠️  Не удалось сохранить файл {OUTPUT_FILE}: {e}")
     else:
-        print("\nℹ️  OUTPUT_FILE отключён (пустая строка) — файл не создан.")
+        print("\nℹ️  OUTPUT_FILE отключён — файл не создан.")
 
     print(f"\n✅ Готово!")
     print(f"   IPv4: {len(ipv4_cmds)}")
